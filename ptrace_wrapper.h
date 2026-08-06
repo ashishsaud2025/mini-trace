@@ -33,10 +33,12 @@
 typedef struct {
     pid_t pid;
     bool  is_entry;                  /* true: syscall entry stop; false: exit stop */
-    long  syscall_nr;                /* syscall number (entry: always; exit: via
-                                        GET_SYSCALL_INFO, else -1 = unknown) */
+    long  syscall_nr;                /* syscall number (entry: always; exit: -1) */
     unsigned long args[MAX_SYSCALL_ARGS]; /* entry: raw args; exit: preserved regs */
-    long  retval;                    /* exit: return value (negative errno if error) */
+    long  retval;                    /* exit: return value = -errno on failure */
+    bool  is_error;                  /* exit: true if the syscall failed.
+                                        Modern path: kernel's is_error flag.
+                                        Fallback path: retval < 0 approximation. */
     struct user_regs_struct regs;    /* raw register snapshot at the stop */
 } syscall_stop_t;
 

@@ -189,7 +189,14 @@ bool ptrace_fetch_stop(pid_t pid, syscall_stop_t *stop)
     memset(&sci, 0, sizeof(sci));
     long r = ptrace(PTRACE_GET_SYSCALL_INFO, pid, sizeof(sci), &sci);
 
-    if (r >= (long)sizeof(struct ptrace_syscall_info)) {
+    /* The kernel only copies as much of the struct as it needs: entry
+     * stops return offsetof(entry)+sizeof(entry) = 80 bytes, exit stops
+     * return offsetof(exit)+sizeof(exit) = 40 bytes.  Accept either. */
+    long entry_end = (long)offsetof(struct ptrace_syscall_info, entry) +
+                     (long)sizeof(sci.entry);
+    long exit_end  = (long)offsetof(struct ptrace_syscall_info, exit) +
+                     (long)sizeof(sci.exit);
+    if (r == entry_end || r == exit_end) {
         /* Modern path: PTRACE_GET_SYSCALL_INFO (Linux >= 5.3) reports the
          * phase directly along with the syscall number, args and retval. */
         if (sci.op == PTRACE_SYSCALL_INFO_ENTRY) {
@@ -205,10 +212,12 @@ bool ptrace_fetch_stop(pid_t pid, syscall_stop_t *stop)
         if (sci.op == PTRACE_SYSCALL_INFO_EXIT) {
             /* The exit branch of ptrace_syscall_info has no `nr` member
              * (only rval/is_error); the caller tracks the syscall number
-             * from the preceding entry stop. */
+             * from the preceding entry stop.  is_error distinguishes real
+             * errno-style failures from negative-but-valid return values. */
             stop->is_entry = false;
             stop->syscall_nr = -1;
             stop->retval = sci.exit.rval;
+            stop->is_error = sci.exit.is_error != 0;
             /* Force the classic markers too, for uniformity. */
             stop->regs.orig_rax = -1;
             stop->regs.rax = (unsigned long)sci.exit.rval;
@@ -226,6 +235,9 @@ bool ptrace_fetch_stop(pid_t pid, syscall_stop_t *stop)
         stop->is_entry = false;
         stop->syscall_nr = -1;
         stop->retval = (long)stop->regs.rax;
+        /* No is_error flag on this path; a negative retval is the closest
+         * approximation (the kernel returns -errno on failure). */
+        stop->is_error = stop->retval < 0;
     } else {
         stop->is_entry = true;
         stop->syscall_nr = (long)stop->regs.orig_rax;

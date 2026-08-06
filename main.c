@@ -133,9 +133,11 @@ static void summary_add(const syscall_stop_t *stop)
     total_syscalls++;
 }
 
-/* Called at the exit stop: on x86_64 a negative return value means the
- * syscall failed with an errno-style error.  Exit stops carry no syscall
- * number, so the error is attributed to the most recent entry (pending_nr). */
+/* Called at the exit stop: the syscall failed.  The failure is detected
+ * via the kernel's is_error flag (modern PTRACE_GET_SYSCALL_INFO path) or
+ * a negative return value (heuristic fallback).  Exit stops carry no
+ * syscall number, so the error is attributed to the most recent entry
+ * (pending_nr). */
 static void summary_add_error(long nr)
 {
     if (nr >= 0 && nr < FILTER_MAX_NR)
@@ -222,7 +224,7 @@ static bool handle_syscall_stop(options_t *opts, syscall_stop_t *stop)
     if (opts->summary) {
         if (stop->is_entry) {
             summary_add(stop);
-        } else if (stop->retval < 0) {
+        } else if (stop->is_error) {
             summary_add_error(pending_nr);
         }
         return true;
