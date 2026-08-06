@@ -121,7 +121,9 @@ static void print_usage(FILE *out)
 /* summary accounting */
 
 static unsigned long long counts[FILTER_MAX_NR];
+static unsigned long long error_counts[FILTER_MAX_NR];
 static unsigned long long total_syscalls;
+static unsigned long long total_errors;
 
 static void summary_add(const syscall_stop_t *stop)
 {
@@ -129,6 +131,16 @@ static void summary_add(const syscall_stop_t *stop)
     if (nr >= 0 && nr < FILTER_MAX_NR)
         counts[nr]++;
     total_syscalls++;
+}
+
+/* Called at the exit stop: on x86_64 a negative return value means the
+ * syscall failed with an errno-style error.  Exit stops carry no syscall
+ * number, so the error is attributed to the most recent entry (pending_nr). */
+static void summary_add_error(long nr)
+{
+    if (nr >= 0 && nr < FILTER_MAX_NR)
+        error_counts[nr]++;
+    total_errors++;
 }
 
 static void print_summary(void)
@@ -139,7 +151,7 @@ static void print_summary(void)
     static int order[FILTER_MAX_NR];
     int n = 0;
     for (int i = 0; i < FILTER_MAX_NR; i++)
-        if (counts[i])
+        if (counts[i] || error_counts[i])
             order[n++] = i;
     for (int i = 1; i < n; i++) {
         int key = order[i];
@@ -154,10 +166,11 @@ static void print_summary(void)
         int nr = order[i];
         double pct = total_syscalls ? 100.0 * (double)counts[nr] /
                                           (double)total_syscalls : 0.0;
-        printf("%9llu %9llu %8.2f%% %s\n", counts[nr], 0ULL, pct,
+        printf("%9llu %9llu %8.2f%% %s\n", counts[nr], error_counts[nr], pct,
                syscall_name(nr));
     }
-    printf("%9llu %9llu %8s %s\n", total_syscalls, 0ULL, "100.00%", "total");
+    printf("%9llu %9llu %8s %s\n", total_syscalls, total_errors, "100.00%",
+           "total");
 }
 
 /* trace loop */
@@ -198,18 +211,22 @@ static bool handle_syscall_stop(options_t *opts, syscall_stop_t *stop)
         handle_fork_detected(stop->pid, stop);
     }
 
-    if (opts->summary) {
-        if (stop->is_entry)
-            summary_add(stop);
-        return true;
-    }
-
-    /* Record the most recent entry number regardless of filtering: exit
-     * stops never carry the syscall number (neither the GET_SYSCALL_INFO
-     * exit branch nor the orig_rax==-1 heuristic provides it), so
-     * pending_nr is the only way to name/classify an exit stop. */
+    /* Record the most recent entry number regardless of mode/filtering:
+     * exit stops never carry the syscall number (neither the
+     * GET_SYSCALL_INFO exit branch nor the orig_rax==-1 heuristic provides
+     * it), so pending_nr is the only way to name/classify an exit stop or
+     * attribute its error. */
     if (stop->is_entry)
         pending_nr = stop->syscall_nr;
+
+    if (opts->summary) {
+        if (stop->is_entry) {
+            summary_add(stop);
+        } else if (stop->retval < 0) {
+            summary_add_error(pending_nr);
+        }
+        return true;
+    }
 
     long nr = pending_nr;
     bool show = !opts->filter_enabled ||
