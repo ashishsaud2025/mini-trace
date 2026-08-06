@@ -11,6 +11,12 @@ CC      ?= gcc
 CFLAGS  ?= -O2 -Wall -Wextra -std=gnu11
 LDFLAGS ?=
 
+# Embed build metadata so the running binary can self-identify (helps when
+# debugging why a deployed binary behaves differently from the source).
+GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+BUILD_DATE := $(shell date -u +%Y%m%d 2>/dev/null || echo unknown)
+CFLAGS += -DGIT_COMMIT=\"$(GIT_COMMIT)\" -DBUILD_DATE=\"$(BUILD_DATE)\"
+
 TARGET  := mini-trace
 
 SRCS := main.c ptrace_wrapper.c arg_decoder.c

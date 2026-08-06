@@ -126,6 +126,18 @@ Two mechanisms are implemented, selected automatically:
   what strace uses. Because the exit number is absent, mini-trace tracks
   the most recent entry number across stops to name and classify exit
   stops.
+
+  **Subtlety:** the syscall's return value is the *number of bytes the
+  kernel wrote into the struct* (padding excluded). Entry stops report
+  `offsetof(entry) + offsetof(entry.args) + sizeof(entry.args)` = 80
+  bytes; exit stops report `offsetof(exit) + offsetof(exit.is_error) +
+  sizeof(exit.is_error)` = **33** bytes — *not* `sizeof(sci.exit)` = 40.
+  `sizeof()` includes 7 bytes of trailing struct padding the kernel never
+  touches. Comparing against 40 silently rejects every exit stop, which
+  drops it into the `orig_rax == -1` fallback and miscounts exits as
+  *second entries* (doubled counts, all-zero errors). mini-trace computes
+  the field end explicitly with `offsetof()` rather than `sizeof()` to
+  stay correct regardless of ABI padding.
 - **`orig_rax == -1` heuristic (fallback).** Before
   `PTRACE_GET_SYSCALL_INFO`, tracers read the register `orig_rax`:
   - entry stop: `orig_rax` holds the syscall number,

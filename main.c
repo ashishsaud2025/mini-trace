@@ -32,6 +32,23 @@
 
 #define FILTER_MAX_NR 512
 
+/* Build metadata is injected by the Makefile; lets a binary identify the
+ * exact commit it was built from (useful when chasing stale builds). */
+#ifndef GIT_COMMIT
+#define GIT_COMMIT "unknown"
+#endif
+#ifndef BUILD_DATE
+#define BUILD_DATE "unknown"
+#endif
+
+static const char *mini_trace_version(void)
+{
+    static char buf[128];
+    snprintf(buf, sizeof(buf), "mini-trace %s (built %s)", GIT_COMMIT,
+             BUILD_DATE);
+    return buf;
+}
+
 /* CLI state  */
 
 typedef struct {
@@ -350,6 +367,11 @@ int main(int argc, char **argv)
         if (!after_dashdash &&
             (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0)) {
             print_usage(stdout);
+            return 0;
+        }
+        if (!after_dashdash &&
+            (strcmp(a, "-V") == 0 || strcmp(a, "--version") == 0)) {
+            printf("%s\n", mini_trace_version());
             return 0;
         }
         if (!after_dashdash && strcmp(a, "--summary") == 0) {

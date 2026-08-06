@@ -190,13 +190,26 @@ bool ptrace_fetch_stop(pid_t pid, syscall_stop_t *stop)
     memset(&sci, 0, sizeof(sci));
     long r = ptrace(PTRACE_GET_SYSCALL_INFO, pid, sizeof(sci), &sci);
 
-    /* The kernel only copies as much of the struct as it needs: entry
-     * stops return offsetof(entry)+sizeof(entry) = 80 bytes, exit stops
-     * return offsetof(exit)+sizeof(exit) = 40 bytes.  Accept either. */
-    long entry_end = (long)offsetof(struct ptrace_syscall_info, entry) +
-                     (long)sizeof(sci.entry);
-    long exit_end  = (long)offsetof(struct ptrace_syscall_info, exit) +
-                     (long)sizeof(sci.exit);
+    /* The kernel returns only the bytes it actually wrote -- struct
+     * padding is NOT included.  Entry stops write through entry.args:
+     *   offsetof(entry) + offsetof(entry.args) + sizeof(entry.args)
+     *   = 24 + 8 + 48 = 80 bytes.
+     * Exit stops write through exit.is_error:
+     *   offsetof(exit) + offsetof(exit.is_error) + sizeof(exit.is_error)
+     *   = 24 + 8 + 1 = 33 bytes.
+     * Note that sizeof(sci.exit) is 16 (7 bytes of trailing padding), so
+     * comparing against it does NOT match the 33 bytes the kernel writes
+     * -- every exit stop would fall through to the heuristic and be
+     * miscounted as an additional entry (doubling counts and hiding
+     * errors).  Compute the field end explicitly instead. */
+    long entry_end =
+        (long)offsetof(struct ptrace_syscall_info, entry) +
+        (long)offsetof(struct ptrace_syscall_info, entry.args) +
+        (long)sizeof(sci.entry.args);                       /* 80 */
+    long exit_end  =
+        (long)offsetof(struct ptrace_syscall_info, exit) +
+        (long)offsetof(struct ptrace_syscall_info, exit.is_error) +
+        (long)sizeof(sci.exit.is_error);                    /* 33 */
     if (r == entry_end || r == exit_end) {
         /* Modern path: PTRACE_GET_SYSCALL_INFO (Linux >= 5.3) reports the
          * phase directly along with the syscall number, args and retval. */
