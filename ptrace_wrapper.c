@@ -81,15 +81,22 @@ bool ptrace_wait_initial_stop(pid_t pid)
     return true;
 }
 
-int ptrace_arm(pid_t pid)
+int ptrace_arm(pid_t pid, bool follow_forks)
 {
     /* TRACESYSGOOD: syscall stops are delivered as SIGTRAP|0x80 instead of
      * plain SIGTRAP, so they can never be confused with exec traps or
      * user-injected SIGTRAPs.
      * TRACEEXEC: a successful execve is reported as a PTRACE_EVENT_EXEC
      * stop instead of the exit syscall stop, and the redundant post-exec
-     * SIGTRAP is suppressed. */
+     * SIGTRAP is suppressed.
+     * TRACEFORK/TRACEVFORK/TRACECLONE (only with -f): fork(2)/vfork(2)/
+     * clone(2) (including pthread creation) report a PTRACE_EVENT_* stop
+     * on the *parent* instead of an ordinary syscall-exit stop, and the
+     * new tracee is auto-attached to us, stopped, and waiting to be armed
+     * the same way. */
     unsigned long opts = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEEXEC;
+    if (follow_forks)
+        opts |= PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE;
     if (ptrace(PTRACE_SETOPTIONS, pid, NULL, (void *)opts) == -1) {
         ptrace_perror("PTRACE_SETOPTIONS", pid);
         return -1;
@@ -153,6 +160,30 @@ bool ptrace_status_signal_stop(int status, int *sig_out)
         return true;
     }
     return false;
+}
+
+int ptrace_status_event(int status)
+{
+    /* Event stops are always plain SIGTRAP (never SIGTRAP|0x80 -- that
+     * combination is reserved for TRACESYSGOOD syscall stops and can't
+     * happen here), with the event id packed into the high byte:
+     * status>>8 == (SIGTRAP | (event<<8)). */
+    if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
+        int event = status >> 16;
+        if (event != 0)
+            return event;
+    }
+    return -1;
+}
+
+pid_t ptrace_get_new_child(pid_t pid)
+{
+    unsigned long msg = 0;
+    if (ptrace(PTRACE_GETEVENTMSG, pid, NULL, &msg) == -1) {
+        ptrace_perror("PTRACE_GETEVENTMSG", pid);
+        return -1;
+    }
+    return (pid_t)msg;
 }
 
 /* register capture */

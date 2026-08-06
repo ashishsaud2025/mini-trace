@@ -7,6 +7,10 @@
  *  - We enable PTRACE_O_TRACESYSGOOD on the tracee.  With that option,
  *    syscall stops are reported as signal SIGTRAP|0x80, which makes them
  *    trivial to tell apart from every other kind of stop.
+ *  - With -f (follow_forks), TRACEFORK/TRACEVFORK/TRACECLONE are also
+ *    armed.  The kernel then auto-attaches every new child/thread to this
+ *    tracer and reports a PTRACE_EVENT_FORK/VFORK/CLONE stop on the
+ *    parent; PTRACE_GETEVENTMSG on the parent yields the new pid.
  *  - Entry vs. exit classification: PTRACE_GET_SYSCALL_INFO (Linux >= 5.3)
  *    when available, otherwise the classic heuristic used by strace for
  *    decades: on x86_64 the kernel sets orig_rax = -1 at the exit stop,
@@ -53,8 +57,13 @@ void ptrace_child_begin(void);
  * Returns false if the child dies or the stop is unexpected. */
 bool ptrace_wait_initial_stop(pid_t pid);
 
-/* Arm TRACESYSGOOD so syscall stops carry SIGTRAP|0x80.  Returns 0 or -1. */
-int ptrace_arm(pid_t pid);
+/* Arm TRACESYSGOOD (+TRACEEXEC) so syscall stops carry SIGTRAP|0x80.  When
+ * follow_forks is true, also arms TRACEFORK|TRACEVFORK|TRACECLONE so that
+ * fork(2)/vfork(2)/clone(2)/pthread creation produce PTRACE_EVENT_* stops
+ * and the new tracee is auto-attached.  Safe to call on a pid that is not
+ * yet reaped by waitpid() as long as it is already ptrace-stopped (true for
+ * every pid this tool ever calls it on).  Returns 0 or -1. */
+int ptrace_arm(pid_t pid, bool follow_forks);
 
 /* continuations */
 
@@ -71,6 +80,15 @@ bool ptrace_status_exited(int status, int *exit_code);
 bool ptrace_status_signaled(int status, int *term_sig);
 bool ptrace_status_syscall_stop(int status);                 /* SIGTRAP|0x80 */
 bool ptrace_status_signal_stop(int status, int *sig_out);    /* other signal stop */
+
+/* PTRACE_EVENT_* stop classification (fork/vfork/clone/exec/...): returns
+ * the event id (e.g. PTRACE_EVENT_FORK, from <linux/ptrace.h>) if `status`
+ * is a plain-SIGTRAP event stop, or -1 if it is not an event stop at all. */
+int ptrace_status_event(int status);
+
+/* PTRACE_GETEVENTMSG: for a FORK/VFORK/CLONE event stop on `pid`, retrieves
+ * the newly created tracee's pid.  Returns -1 on failure. */
+pid_t ptrace_get_new_child(pid_t pid);
 
 /* register capture */
 

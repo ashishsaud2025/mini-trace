@@ -5,6 +5,7 @@ A minimal, strace-like **syscall tracer** for Linux (x86_64), built directly on
 
 ```
 Usage: mini-trace [options] <command> [args...]
+  -f                            follow fork/vfork/clone children too
   --filter <name1,name2,...>   only show listed syscalls
   --summary                    print a syscall count table instead of a trace
   -h, --help                   show help
@@ -77,6 +78,28 @@ $ ./mini-trace --summary find /tmp -maxdepth 1 -type f
         4        0     4.76% openat
        84        0   100.00% total
 ```
+
+### Example output: Follow forks (`-f`)
+
+```
+$ ./mini-trace -f make -j2 -C /tmp/proj
+mini-trace: [pid 12401] new child pid 12402 (via clone)
+mini-trace: [pid 12402] attached
+ 12402: syscall  59 (execve)( "/usr/bin/cc", ["cc", "-c", "main.c"], ... )
+ 12402:           execve = 0 /* new program image loaded */
+ ...
+mini-trace: [pid 12402] exited with 0
+ 12401: syscall  61 (wait4)( 12402, 0x7ffd..., 0x0, 0x0, 0x0, 0x0 )
+ 12401:            wait4 = 12402
+ 12401: +++ exited with 0 +++
+```
+
+Every process/thread `mini-trace` attaches to gets its own `[pid N] ...`
+note on stderr (attach, new-child, exit/kill), so it's easy to tell which
+pid produced which trace line even when several are interleaved — stdout
+trace lines are already prefixed with the pid that made the call, same as
+without `-f`. `--summary -f` combines counts and errors across every
+traced process/thread into one table.
 
 ---
 
@@ -159,7 +182,42 @@ exec traps or user-injected `SIGTRAP`s. `PTRACE_O_TRACEEXEC` additionally
 replaces the exit stop of a successful `execve` with a `PTRACE_EVENT_EXEC`
 stop and suppresses the redundant post-`exec` `SIGTRAP`.
 
-### 4. Reading tracee memory
+### 4. Following forks (`-f`)
+
+With `-f`, `PTRACE_SETOPTIONS` additionally arms `PTRACE_O_TRACEFORK |
+PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE`. With those set, a `fork(2)` /
+`vfork(2)` / `clone(2)` (including pthread creation) doesn't produce an
+ordinary syscall-exit stop on the caller — it produces a `PTRACE_EVENT_FORK`
+/ `_VFORK` / `_CLONE` stop instead, and the kernel auto-attaches the new
+tracee to the same tracer, already ptrace-stopped. `PTRACE_GETEVENTMSG` on
+the parent's event stop yields the new pid, purely for the `[pid N] new
+child pid M` log line.
+
+Because `mini-trace` now has more than one tracee alive at once, the trace
+loop switches from `waitpid(specific_pid, ...)` to `waitpid(-1, ...)`, and a
+small per-pid table (`tracee_state_t`) replaces the single global "which
+syscall is this exit stop for" variable — each tracee tracks its own
+in-flight syscall number independently, since two tracees can be at
+different points of their own entry/exit cycle simultaneously. The loop
+keeps running until every registered tracee has exited; only the very first
+process's exit code/signal becomes `mini-trace`'s own exit status (all other
+processes just print an "exited"/"killed" note and drop out of the table).
+
+**A real race, worth calling out explicitly:** the ptrace(2) man page
+suggests a newly forked tracee is already ptrace-stopped and safe to call
+`PTRACE_SETOPTIONS` on the moment you observe the parent's event stop.
+In practice, `PTRACE_SETOPTIONS` on the brand-new pid at that exact moment
+reliably fails with `ESRCH` here — the kernel appears to require the tracer
+to `waitpid()` the new tracee at least once before most ptrace(2) requests
+on it succeed. Since the kernel and man page also don't guarantee whether
+the parent's event stop or the child's own first stop is observed first by
+`waitpid(-1, ...)`, `mini-trace` doesn't try to preemptively arm the new
+pid at all: `handle_new_child()` only logs it, and the *generic* "first
+time we see this pid" path in the main loop — the same one that handles
+this exact "which stop do I see first" ambiguity — does the actual
+`PTRACE_SETOPTIONS` + resume, whichever order the two stops arrive in.
+
+### 5. Reading tracee memory
 
 To print strings (`open("foo")`, `execve("/bin/ls", ...)`) the tracer must
 read the tracee's address space while it is stopped:
@@ -207,16 +265,21 @@ make syscall-table SYSCALL_TBL=/path/to/linux/arch/x86/entry/syscalls/syscall_64
 
 ---
 
-## Multi-process / multi-threaded targets (documented limitation)
+## Multi-process / multi-threaded targets
 
-- `fork`/`vfork`/`clone`/`clone3` are **detected** and a note is printed
-  to stderr — the process does not crash.
-- Only the **initial child** is traced; forked children run untraced.
-- Threads created with `CLONE_THREAD` are not followed, which can make
-  syscall events appear interleaved or out of order.
-- These are deliberate scope decisions; archiving full multi-process tracing
-  would require a `waitpid(-1)` loop with per-pid state and is left as an
-  exercise.
+- Pass **`-f`** to also trace every `fork`/`vfork`/`clone`/`clone3` child
+  (including pthreads), recursively, until all of them have exited — see
+  *Following forks (`-f`)* above for how this is implemented.
+- Without `-f`, `fork`/`vfork`/`clone`/`clone3` are still **detected** and a
+  note is printed to stderr suggesting `-f`; the forked child itself runs
+  untraced and the process does not crash.
+- `clone3` (nr 435) is detected at the syscall-entry note the same as the
+  others, but `-f`'s auto-attach relies on `PTRACE_O_TRACECLONE`, which
+  covers it identically to `clone(2)` on current kernels.
+- Trace lines from different tracees can be interleaved on stdout (each is
+  prefixed with its own pid, same as always); `mini-trace` does not attempt
+  to serialize output per-process the way some tools' `-f` output grouping
+  does.
 
 ## Requirements & permissions
 
