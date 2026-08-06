@@ -191,17 +191,18 @@ bool ptrace_fetch_stop(pid_t pid, syscall_stop_t *stop)
     long r = ptrace(PTRACE_GET_SYSCALL_INFO, pid, sizeof(sci), &sci);
 
     /* The kernel returns only the bytes it actually wrote -- struct
-     * padding is NOT included.  Entry stops write through entry.args:
-     *   offsetof(entry) + offsetof(entry.args) + sizeof(entry.args)
-     *   = 24 + 8 + 48 = 80 bytes.
-     * Exit stops write through exit.is_error:
-     *   offsetof(exit) + offsetof(exit.is_error) + sizeof(exit.is_error)
-     *   = 24 + 8 + 1 = 33 bytes.
-     * Note that sizeof(sci.exit) is 16 (7 bytes of trailing padding), so
-     * comparing against it does NOT match the 33 bytes the kernel writes
-     * -- every exit stop would fall through to the heuristic and be
-     * miscounted as an additional entry (doubling counts and hiding
-     * errors).  Compute the field end explicitly instead. */
+     * padding is NOT included.  offsetof() already measures from the top
+     * of the whole struct, so the end of the last field written is
+     * simply offsetof(field) + sizeof(field):
+     *   entry stop: offsetof(entry.args) + sizeof(entry.args)
+     *               = 32 + 48 = 80 bytes
+     *   exit stop:  offsetof(exit.is_error) + sizeof(exit.is_error)
+     *               = 32 + 1 = 33 bytes
+     * Do NOT add offsetof(entry)/offsetof(exit) on top -- the union
+     * header (24 bytes) is already included in the nested offsetof, so
+     * adding it would double-count (producing 104/57) and no stop would
+     * ever match.  sizeof(sci.exit) is 16 (7 bytes of trailing padding),
+     * which does not match the 33 bytes the kernel writes either. */
     long entry_end =
         (long)offsetof(struct ptrace_syscall_info, entry.args) +
         (long)sizeof(sci.entry.args);                       /* 80 */

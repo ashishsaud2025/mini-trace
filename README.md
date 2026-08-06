@@ -128,16 +128,24 @@ Two mechanisms are implemented, selected automatically:
   stops.
 
   **Subtlety:** the syscall's return value is the *number of bytes the
-  kernel wrote into the struct* (padding excluded). Entry stops report
-  `offsetof(entry) + offsetof(entry.args) + sizeof(entry.args)` = 80
-  bytes; exit stops report `offsetof(exit) + offsetof(exit.is_error) +
-  sizeof(exit.is_error)` = **33** bytes — *not* `sizeof(sci.exit)` = 40.
-  `sizeof()` includes 7 bytes of trailing struct padding the kernel never
-  touches. Comparing against 40 silently rejects every exit stop, which
-  drops it into the `orig_rax == -1` fallback and miscounts exits as
-  *second entries* (doubled counts, all-zero errors). mini-trace computes
-  the field end explicitly with `offsetof()` rather than `sizeof()` to
-  stay correct regardless of ABI padding.
+  kernel wrote into the struct* (padding excluded). `offsetof()` already
+  measures from the top of the whole struct, so the end of the last field
+  written is simply `offsetof(field) + sizeof(field)`. Entry stops report
+  `offsetof(entry.args) + sizeof(entry.args)` = **80** bytes; exit stops
+  report `offsetof(exit.is_error) + sizeof(exit.is_error)` = **33** bytes
+  — *not* `sizeof(sci.exit)` = 40. Two classic mistakes:
+
+  - `sizeof(sci.exit)` is 16 (7 bytes of trailing padding), so comparing
+    against 40 silently rejects every exit stop, dropping it into the
+    `orig_rax == -1` fallback and miscounting exits as *second entries*
+    (doubled counts, all-zero errors).
+  - Adding `offsetof(entry)` *and* `offsetof(entry.args)` double-counts
+    the 24-byte union header (the nested offsetof already includes it),
+    producing 104/57, which matches nothing either.
+
+  mini-trace computes the field end with a single `offsetof(field) +
+  sizeof(field)` — never `sizeof()` of the padded sub-struct, and never
+  a second offset term — so the comparison is immune to ABI padding.
 - **`orig_rax == -1` heuristic (fallback).** Before
   `PTRACE_GET_SYSCALL_INFO`, tracers read the register `orig_rax`:
   - entry stop: `orig_rax` holds the syscall number,
