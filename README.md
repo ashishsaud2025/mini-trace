@@ -6,7 +6,12 @@ A minimal, strace-like **syscall tracer** for Linux (x86_64), built directly on
 ```
 Usage: mini-trace [options] <command> [args...]
   -f                            follow fork/vfork/clone children too
+  -T                            also show time per call on the full trace
+                                (--summary shows per-syscall timing always)
   --filter <name1,name2,...>   only show listed syscalls
+  -e trace=<group1,...>        only show syscalls in given categories
+                                (file, network, process, memory) --
+                                composes with --filter
   --summary                    print a syscall count table instead of a trace
   -h, --help                   show help
 ```
@@ -65,19 +70,26 @@ $ ./mini-trace --filter open,openat,connect ls /etc
  ...
 ```
 
-### Example output:  Summary
+### Example output: Summary
 
 ```
 $ ./mini-trace --summary find /tmp -maxdepth 1 -type f
-    calls    errors      pct syscall
--------- -------- -------- --------
-       36        0    42.86% newfstatat
-       22        0    26.19% getdents64
-       14        0    16.67% mmap
-        5        0     5.95% close
-        4        0     4.76% openat
-       84        0   100.00% total
+    calls    errors     seconds  usecs/call      pct syscall
+ --------  -------- ----------- -----------  -------- --------
+       36        0    0.000210           5    42.86% newfstatat
+       22        0    0.000098           4    26.19% getdents64
+       14        0    0.000061           4    16.67% mmap
+        5        0    0.000012           2     5.95% close
+        4        0    0.000034           8     4.76% openat
+       84        0    0.000431           5   100.00% total
 ```
+
+`--summary` always includes per-syscall timing (`seconds` = total time spent
+inside that syscall across every call; `usecs/call` = the average) —
+this doesn't require `-T`; `-T` only controls whether the *full*, per-line
+trace (without `--summary`) also prints a `<seconds>` timestamp on each
+line. Timing is measured with `CLOCK_MONOTONIC` between the entry and exit
+stop of each call, same technique as the `-T` section below.
 
 ### Example output: Follow forks (`-f`)
 
@@ -100,6 +112,77 @@ pid produced which trace line even when several are interleaved — stdout
 trace lines are already prefixed with the pid that made the call, same as
 without `-f`. `--summary -f` combines counts and errors across every
 traced process/thread into one table.
+
+### Example output: Category filtering (`-e trace=`)
+
+```
+$ ./mini-trace -e trace=network python3 -c "
+import socket
+s = socket.socket()
+s.settimeout(1)
+try:
+    s.connect(('example.com', 80))
+except Exception:
+    pass
+"
+   943: syscall  41 (socket)( 2, 524289, 0 /* domain, type, protocol */ )
+   943:         socket = 4
+   943: syscall  54 (setsockopt)( 4<socket:[1768]>, 0x0, 0xb, 0x7ffe21190904, 0x4, 0x7ffe21191be0 )
+   943:     setsockopt = 0
+   943: syscall  42 (connect)( 4<socket:[1774]>, {AF_INET, port=53, addr=8.8.8.8} )
+   943:        connect = -1 Operation now in progress
+```
+
+`file`, `network`, `process`, and `memory` are curated syscall groups (see
+the `cat_file` / `cat_network` / `cat_process` / `cat_memory` arrays in
+`main.c`) — not an exhaustive syscall-classification database, just enough
+of each family to be useful for a quick look. Category names and individual
+syscall names/numbers can be mixed in one `-e trace=` list, and it writes
+into the same underlying filter as `--filter`, so `-e trace=network,openat`
+or combining `-e trace=file` with a separate `--filter` call both work as
+expected.
+
+### Example output: Symbolic flag decoding
+
+`open`/`openat`'s flags argument and `mmap`/`mprotect`'s protection and
+mapping-flags arguments are decoded into their `O_*`/`PROT_*`/`MAP_*` names
+instead of raw hex:
+
+```
+$ ./mini-trace -e trace=file,memory cat /etc/hostname
+   923: syscall   9 (mmap)( 0x0, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0x0 )
+   923:           mmap = 140159175163904
+   923: syscall 257 (openat)( -1, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC )
+   923:         openat = 3
+   923: syscall   9 (mmap)( 0x0, 49731, PROT_READ, MAP_PRIVATE, 3, 0x0 )
+   923:           mmap = 140159175110656
+   923: syscall 257 (openat)( -1, "/etc/hostname", O_RDONLY )
+   923:         openat = 3
+```
+
+Unknown/leftover bits (anything the decoder doesn't recognize) are still
+appended as `|0x...` rather than silently dropped, same best-effort
+philosophy as the rest of the decoders.
+
+### Example output: Per-syscall timing (`-T`)
+
+```
+$ ./mini-trace -T cat /etc/hostname
+   923: syscall 257 (openat)( -1, "/etc/hostname", O_RDONLY )
+   923:         openat = 3 <0.000021>
+   923: syscall   0 (read)( 3</etc/hostname>, "example\n", 131072 )
+   923:           read = 8 <0.000009>
+   923: syscall   3 (close)( 3</etc/hostname> )
+   923:          close = 0 <0.000012>
+```
+
+The `<seconds>` is wall-clock time between the syscall's entry stop and its
+exit stop, measured with `CLOCK_MONOTONIC` — the same measurement real
+`strace -T` makes (a userspace stopwatch around the two ptrace stops, not a
+number the kernel reports). `-T` combines with `--summary` too (the timing
+is simply not shown in that mode, since the summary table has no per-call
+line to attach it to) and with `-f` (each tracee's entries/exits are timed
+independently via its own `tracee_state_t` slot).
 
 ---
 
@@ -217,7 +300,67 @@ time we see this pid" path in the main loop — the same one that handles
 this exact "which stop do I see first" ambiguity — does the actual
 `PTRACE_SETOPTIONS` + resume, whichever order the two stops arrive in.
 
-### 5. Reading tracee memory
+### 5. Category filters and flag decoding
+
+`-e trace=<groups>` is implemented as a thin layer over the same
+`filter_list[512]` bitmap `--filter` already populates: each category name
+just expands to a small, hand-picked array of syscall numbers (see
+`cat_file`/`cat_network`/`cat_process`/`cat_memory` in `main.c`) and sets
+those bits, so the trace loop's filtering logic doesn't need to know
+categories exist at all.
+
+Flag decoding (`emit_open_flags`, `emit_mmap_prot`, `emit_mmap_flags` in
+`arg_decoder.c`) walks a table of `(bitmask, name)` pairs, testing each with
+an *equality* check (`(rem & bit) == bit`), not a truthiness check
+(`rem & bit`) — the difference matters for compound flags like `O_SYNC`,
+whose value is a strict superset of `O_DSYNC`'s bits. Checking `O_SYNC`
+before `O_DSYNC` (superset before subset) and clearing recognized bits as
+they're matched means the decoder never double-reports and never misses a
+genuinely-set flag; any bits nothing recognizes are still shown as trailing
+hex instead of silently vanishing.
+
+### 6. Per-syscall timing (`-T`, and `--summary` always)
+
+Each `tracee_state_t` gained a `struct timespec entry_time` plus a `bool
+entry_time_valid`. On a syscall *entry* stop, `clock_gettime(CLOCK_MONOTONIC,
+...)` stamps `entry_time` (and sets the flag) before the tracee is resumed;
+on the matching *exit* stop, another `clock_gettime()` call diffs against
+it. This is deliberately a wall-clock measurement taken from the tracer's
+side of two ptrace stops -- the same technique real `strace -T` uses -- not
+a duration the kernel reports back.
+
+`--summary` always accumulates this timing (total seconds and
+average-per-call, shown as new `seconds`/`usecs/call` columns), regardless
+of whether `-T` was passed; `-T` only additionally controls whether the
+*full*, per-line trace prints a `<seconds>` suffix on each line -- the two
+are independent switches sharing one measurement.
+
+**A real bug this uncovered:** the very first stop is not always a
+syscall-entry stop the way `wait_and_handle`'s top comment implies. After
+the leader's `PTRACE_EVENT_EXEC` stop (or, with `-f`, a freshly-attached
+child's synthetic first stop), the *next* stop this tool receives can
+already be shaped like a syscall-exit -- with no matching entry stop ever
+having been seen for that pid. The earliest version of this feature always
+diffed against `entry_time`, which starts life zero-initialized; for that
+one transitional stop per process, this computed "elapsed time since the
+system booted" (hundreds of seconds) instead of "elapsed time in a
+syscall" -- inflating `--summary`'s `total` row by orders of magnitude
+while every individual syscall's row stayed correct (since that row's own
+`time_sec[nr]` was never touched -- only the un-attributable `nr == -1`
+case fed the global `total_time_sec`, which is exactly why the bug was
+invisible per-row and only visible in the total). The fix is
+`entry_time_valid`: timing is now only ever computed for a stop whose
+matching entry was actually observed and stamped; an untimeable exit
+(pending_nr == -1) contributes its call/error counts as before but simply
+skips time accounting rather than diffing against a meaningless sentinel.
+
+Because timing state lives per-pid in `tracee_state_t` (the same table that
+makes `-f` safe for interleaved tracees), both the bug and the fix compose
+correctly with `-f`: each tracee's entry/exit pairs -- and each tracee's one
+untimeable transitional stop -- are tracked independently and can't be
+clobbered by another tracee's stop landing in between.
+
+### 7. Reading tracee memory
 
 To print strings (`open("foo")`, `execve("/bin/ls", ...)`) the tracer must
 read the tracee's address space while it is stopped:

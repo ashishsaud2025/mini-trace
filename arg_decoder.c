@@ -1,9 +1,10 @@
 /* arg_decoder.c -- best-effort decoding of syscall arguments.
  *
  * We intentionally decode only a small set of syscalls deeply (pointer
- * strings, file descriptors, sockaddr structs).  Everything else degrades
- * to hex, because the goal of this project is to demonstrate the mechanism
- * -- not to reimplement strace's thousands of decoder lines.
+ * strings, file descriptors, sockaddr structs, and the open/mmap/mprotect
+ * flag bitmasks).  Everything else degrades to hex, because the goal of
+ * this project is to demonstrate the mechanism -- not to reimplement
+ * strace's thousands of decoder lines.
  *
  * Reads of tracee memory go through ptrace_read_string / ptrace_read_mem.
  * A failed read never aborts the trace; we print a "<unreadable>" marker.
@@ -22,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -127,13 +129,127 @@ static void emit_string(pid_t pid, unsigned long addr)
     free(s);
 }
 
+/* flag/bitmask decoders
+ *
+ * These decode a raw integer into the symbolic names a human (or a diff
+ * against another trace) actually wants, e.g. `O_WRONLY|O_CREAT|O_TRUNC`
+ * instead of `0x241`.  Every decoder clears bits from a local `rem` copy
+ * as it recognizes them, so any leftover/unknown bits are still shown as
+ * hex rather than silently dropped -- best-effort, same as the rest of
+ * this file.
+ */
+
+/* Clears `bit` out of *rem and emits `name` (with a leading '|' unless
+ * `*first`) iff *rem contains the *entire* `bit` pattern.  The equality
+ * test (not just "any bit set") matters for compound flags like O_SYNC,
+ * whose value is a superset of O_DSYNC's -- see emit_open_flags. */
+static void emit_bit(unsigned long *rem, bool *first, unsigned long bit,
+                     const char *name)
+{
+    if (bit != 0 && (*rem & bit) == bit) {
+        emit("%s%s", *first ? "" : "|", name);
+        *first = false;
+        *rem &= ~bit;
+    }
+}
+
+static void emit_open_flags(unsigned long flags)
+{
+    /* O_ACCMODE (the low 2 bits) is a tri-state, not an independent flag:
+     * exactly one of these three is "set" for every open(). */
+    unsigned long acc = flags & O_ACCMODE;
+    emit("%s", acc == O_WRONLY ? "O_WRONLY"
+              : acc == O_RDWR  ? "O_RDWR"
+                                : "O_RDONLY");
+
+    unsigned long rem = flags & ~(unsigned long)O_ACCMODE;
+    bool first = false; /* we already emitted the access-mode token */
+
+    /* O_SYNC's value is O_DSYNC | __O_SYNC (a strict superset), so it must
+     * be checked -- and cleared -- before O_DSYNC, or a real O_SYNC would
+     * incorrectly print as "O_DSYNC" with a stray bit left over. */
+    emit_bit(&rem, &first, O_SYNC, "O_SYNC");
+    emit_bit(&rem, &first, O_DSYNC, "O_DSYNC");
+    emit_bit(&rem, &first, O_CREAT, "O_CREAT");
+    emit_bit(&rem, &first, O_EXCL, "O_EXCL");
+    emit_bit(&rem, &first, O_NOCTTY, "O_NOCTTY");
+    emit_bit(&rem, &first, O_TRUNC, "O_TRUNC");
+    emit_bit(&rem, &first, O_APPEND, "O_APPEND");
+    emit_bit(&rem, &first, O_NONBLOCK, "O_NONBLOCK");
+    emit_bit(&rem, &first, O_DIRECT, "O_DIRECT");
+    emit_bit(&rem, &first, O_LARGEFILE, "O_LARGEFILE");
+    emit_bit(&rem, &first, O_DIRECTORY, "O_DIRECTORY");
+    emit_bit(&rem, &first, O_NOFOLLOW, "O_NOFOLLOW");
+    emit_bit(&rem, &first, O_NOATIME, "O_NOATIME");
+    emit_bit(&rem, &first, O_CLOEXEC, "O_CLOEXEC");
+#ifdef O_TMPFILE
+    emit_bit(&rem, &first, O_TMPFILE, "O_TMPFILE");
+#endif
+    if (rem)
+        emit("%s0x%lx", first ? "" : "|", rem);
+}
+
+static void emit_mmap_prot(unsigned long prot)
+{
+    if (prot == PROT_NONE) {
+        emit("PROT_NONE");
+        return;
+    }
+    unsigned long rem = prot;
+    bool first = true;
+    emit_bit(&rem, &first, PROT_READ, "PROT_READ");
+    emit_bit(&rem, &first, PROT_WRITE, "PROT_WRITE");
+    emit_bit(&rem, &first, PROT_EXEC, "PROT_EXEC");
+    if (rem)
+        emit("%s0x%lx", first ? "" : "|", rem);
+}
+
+static void emit_mmap_flags(unsigned long flags)
+{
+    unsigned long rem = flags;
+    bool first = true;
+    /* MAP_SHARED / MAP_PRIVATE are mutually exclusive but not bit-tested
+     * against each other by the kernel; showing whichever bit is present
+     * matches what real callers actually pass. */
+    emit_bit(&rem, &first, MAP_SHARED, "MAP_SHARED");
+    emit_bit(&rem, &first, MAP_PRIVATE, "MAP_PRIVATE");
+    emit_bit(&rem, &first, MAP_FIXED, "MAP_FIXED");
+    emit_bit(&rem, &first, MAP_ANONYMOUS, "MAP_ANONYMOUS");
+#ifdef MAP_GROWSDOWN
+    emit_bit(&rem, &first, MAP_GROWSDOWN, "MAP_GROWSDOWN");
+#endif
+#ifdef MAP_DENYWRITE
+    emit_bit(&rem, &first, MAP_DENYWRITE, "MAP_DENYWRITE");
+#endif
+#ifdef MAP_EXECUTABLE
+    emit_bit(&rem, &first, MAP_EXECUTABLE, "MAP_EXECUTABLE");
+#endif
+    emit_bit(&rem, &first, MAP_LOCKED, "MAP_LOCKED");
+    emit_bit(&rem, &first, MAP_NORESERVE, "MAP_NORESERVE");
+    emit_bit(&rem, &first, MAP_POPULATE, "MAP_POPULATE");
+#ifdef MAP_NONBLOCK
+    emit_bit(&rem, &first, MAP_NONBLOCK, "MAP_NONBLOCK");
+#endif
+    emit_bit(&rem, &first, MAP_STACK, "MAP_STACK");
+#ifdef MAP_HUGETLB
+    emit_bit(&rem, &first, MAP_HUGETLB, "MAP_HUGETLB");
+#endif
+    if (rem)
+        emit("%s0x%lx", first ? "" : "|", rem);
+}
+
 /* per-syscall decoders */
 
 static void dec_open(pid_t pid, const unsigned long a[MAX_SYSCALL_ARGS])
 {
     emit_string(pid, a[0]);
-    emit(", 0x%lx", a[1]);
-    if (a[1] & (O_CREAT | O_TMPFILE))
+    emit(", ");
+    emit_open_flags(a[1]);
+    if (a[1] & (O_CREAT
+#ifdef O_TMPFILE
+                | O_TMPFILE
+#endif
+                ))
         emit(", 0%lo", a[2]); /* mode %o is what strace prints */
 }
 
@@ -142,8 +258,13 @@ static void dec_openat(pid_t pid, const unsigned long a[MAX_SYSCALL_ARGS])
     emit_fd(pid, a[0]);
     emit(", ");
     emit_string(pid, a[1]);
-    emit(", 0x%lx", a[2]);
-    if (a[2] & (O_CREAT | O_TMPFILE))
+    emit(", ");
+    emit_open_flags(a[2]);
+    if (a[2] & (O_CREAT
+#ifdef O_TMPFILE
+                | O_TMPFILE
+#endif
+                ))
         emit(", 0%lo", a[3]);
 }
 
@@ -163,8 +284,22 @@ static void dec_close(pid_t pid, const unsigned long a[MAX_SYSCALL_ARGS])
 static void dec_mmap(pid_t pid, const unsigned long a[MAX_SYSCALL_ARGS])
 {
     (void)pid;
-    emit("0x%lx, %lu, 0x%lx, 0x%lx, %ld, 0x%lx",
-         a[0], a[1], a[2], a[3], (long)a[4], a[5]);
+    emit("0x%lx, %lu, ", a[0], a[1]);
+    emit_mmap_prot(a[2]);
+    emit(", ");
+    emit_mmap_flags(a[3]);
+    emit(", %ld, 0x%lx", (long)a[4], a[5]);
+}
+
+/* mprotect(2) only takes (addr, len, prot) -- unlike mmap it has no fd or
+ * offset, so it gets its own decoder rather than reusing dec_mmap's
+ * 6-argument shape (which would print two register slots mprotect never
+ * uses as if they meant something). */
+static void dec_mprotect(pid_t pid, const unsigned long a[MAX_SYSCALL_ARGS])
+{
+    (void)pid;
+    emit("0x%lx, %lu, ", a[0], a[1]);
+    emit_mmap_prot(a[2]);
 }
 
 static void dec_execve(pid_t pid, const unsigned long a[MAX_SYSCALL_ARGS])
@@ -289,8 +424,10 @@ const char *arg_decode(pid_t pid, long nr,
         dec_close(pid, a);
         return buf;
     case 9:   /* mmap */
-    case 10:  /* mprotect */
         dec_mmap(pid, a);
+        return buf;
+    case 10:  /* mprotect */
+        dec_mprotect(pid, a);
         return buf;
     case 59:  /* execve */
         dec_execve(pid, a);

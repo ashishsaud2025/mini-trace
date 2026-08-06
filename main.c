@@ -3,7 +3,9 @@
  * Usage:
  *   mini-trace <command> [args...]
  *   mini-trace -f <command> [args...]
+ *   mini-trace -T <command> [args...]
  *   mini-trace --filter open,openat,connect <command> [args...]
+ *   mini-trace -e trace=network,file <command> [args...]
  *   mini-trace --summary <command> [args...]
  *
  * Flow:
@@ -30,6 +32,7 @@
 #include <string.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "arg_decoder.h"
@@ -61,9 +64,66 @@ typedef struct {
     bool summary;
     bool filter_enabled;
     bool follow_forks;   /* -f: also trace fork/vfork/clone children */
+    bool timing;         /* -T: show time spent inside each syscall */
 } options_t;
 
 static bool filter_list[FILTER_MAX_NR];
+
+/* -e trace=<category> syscall groups (x86_64 numbers, from syscall_table.h).
+ * Deliberately curated, not exhaustive: enough of each family to make the
+ * category useful, not a reimplementation of strace's much larger tables.
+ *
+ * file:    open/openat/close/read/write/stat family, path-based ops
+ *          (rename, unlink, link, mkdir/rmdir, chmod/chown, readlink, ...)
+ * network: socket(2) and everything that takes a socket fd
+ * process: fork/vfork/clone/execve/exit/wait4/kill
+ * memory:  mmap/mprotect/munmap */
+static const int cat_file[] = {
+    0, 1, 2, 3, 4, 5, 6, 8, 21, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85,
+    86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 161, 217, 257, 258, 259, 260,
+    262, 263, 264, 265, 266, 267, 268, 269, 280, 316,
+};
+static const int cat_network[] = {
+    41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 288,
+};
+static const int cat_process[] = {56, 57, 58, 59, 60, 61, 62, 435};
+static const int cat_memory[] = {9, 10, 11};
+
+typedef struct {
+    const char *name;
+    const int *nrs;
+    size_t count;
+} category_t;
+
+#define CAT(arr) arr, sizeof(arr) / sizeof(arr[0])
+static const category_t categories[] = {
+    {"file", CAT(cat_file)},
+    {"network", CAT(cat_network)},
+    {"process", CAT(cat_process)},
+    {"memory", CAT(cat_memory)},
+};
+#undef CAT
+
+/* Matches `name` (optionally "%"-prefixed, as strace also accepts) against
+ * a known category and, on a hit, sets every syscall in it in filter_list.
+ * Returns false if `name` isn't a known category (caller then tries it as
+ * a plain syscall name/number instead). */
+static bool apply_category(const char *name)
+{
+    if (name[0] == '%')
+        name++;
+    for (size_t i = 0; i < sizeof(categories) / sizeof(categories[0]); i++) {
+        if (strcmp(name, categories[i].name) != 0)
+            continue;
+        for (size_t j = 0; j < categories[i].count; j++) {
+            int nr = categories[i].nrs[j];
+            if (nr >= 0 && nr < FILTER_MAX_NR)
+                filter_list[nr] = true;
+        }
+        return true;
+    }
+    return false;
+}
 
 static bool parse_filter_list(const char *csv)
 {
@@ -117,6 +177,70 @@ static bool parse_filter_list(const char *csv)
     return count > 0;
 }
 
+/* Parses the value of `-e trace=<...>`: a comma-separated list where each
+ * token is either a category name (file, network, process, memory -- see
+ * `categories[]` above) or, falling back, an individual syscall name/number
+ * exactly like --filter accepts.  Both forms write into the same
+ * filter_list[], so `-e trace=network,openat` and `--filter` compose
+ * naturally if both are given. */
+static bool parse_trace_expr(const char *csv)
+{
+    char *copy = strdup(csv);
+    if (!copy)
+        return false;
+
+    char *save = NULL;
+    int count = 0;
+    bool ok = true;
+    for (char *tok = strtok_r(copy, ",", &save); tok;
+         tok = strtok_r(NULL, ",", &save)) {
+        while (*tok == ' ' || *tok == '\t')
+            tok++;
+        if (*tok == '\0')
+            continue;
+
+        if (apply_category(tok)) {
+            count++;
+            continue;
+        }
+
+        /* Not a category: fall back to the same name/number lookup
+         * --filter uses. */
+        char *end = NULL;
+        long num = strtol(tok, &end, 10);
+        int nr;
+        if (end != tok && *end == '\0') {
+            nr = (int)num;
+        } else {
+            nr = -1;
+            for (long i = 0; i < (long)SYSCALL_TABLE_SIZE; i++) {
+                if (syscall_table[i] && strcmp(syscall_table[i], tok) == 0) {
+                    nr = (int)i;
+                    break;
+                }
+            }
+            if (nr < 0) {
+                fprintf(stderr,
+                        "mini-trace: unknown category or syscall '%s' in "
+                        "-e trace=\n",
+                        tok);
+                ok = false;
+                break;
+            }
+        }
+        if (nr >= 0 && nr < FILTER_MAX_NR) {
+            filter_list[nr] = true;
+        } else {
+            fprintf(stderr, "mini-trace: syscall number %d out of range\n", nr);
+            ok = false;
+            break;
+        }
+        count++;
+    }
+    free(copy);
+    return ok && count > 0;
+}
+
 static void print_usage(FILE *out)
 {
     fprintf(out,
@@ -130,9 +254,22 @@ static void print_usage(FILE *out)
             "                              (like strace -f) and trace them\n"
             "                              too, until every traced process\n"
             "                              has exited.\n"
+            "  -T                           Also show time spent inside each\n"
+            "                              syscall on the full trace, e.g.\n"
+            "                              '= 3 <0.000041>'.  --summary\n"
+            "                              always shows per-syscall timing\n"
+            "                              (seconds, usecs/call) whether\n"
+            "                              or not -T is given.\n"
             "  --filter <name1,name2,...>  Only show listed syscalls.\n"
             "                              Names or numbers; e.g.\n"
             "                              --filter open,openat,connect\n"
+            "  -e trace=<group1,...>       Only show syscalls in the given\n"
+            "                              categories: file, network,\n"
+            "                              process, memory.  Category names\n"
+            "                              and individual syscall\n"
+            "                              names/numbers may be mixed, and\n"
+            "                              this composes with --filter;\n"
+            "                              e.g. -e trace=network,openat\n"
             "  --summary                   Print a syscall count table\n"
             "                              instead of the full trace.\n"
             "                              With -f, counts are combined\n"
@@ -142,7 +279,8 @@ static void print_usage(FILE *out)
             "Examples:\n"
             "  mini-trace ls -la\n"
             "  mini-trace --filter open,openat ls /etc\n"
-            "  mini-trace --summary find /usr -name Makefile\n"
+            "  mini-trace -e trace=network curl example.com\n"
+            "  mini-trace -T --summary find /usr -name Makefile\n"
             "  mini-trace -f make -j4\n"
             "\n"
             "Notes:\n"
@@ -153,8 +291,10 @@ static void print_usage(FILE *out)
 
 static unsigned long long counts[FILTER_MAX_NR];
 static unsigned long long error_counts[FILTER_MAX_NR];
+static double time_sec[FILTER_MAX_NR];       /* total time inside each nr */
 static unsigned long long total_syscalls;
 static unsigned long long total_errors;
+static double total_time_sec;
 
 static void summary_add(const syscall_stop_t *stop)
 {
@@ -162,6 +302,19 @@ static void summary_add(const syscall_stop_t *stop)
     if (nr >= 0 && nr < FILTER_MAX_NR)
         counts[nr]++;
     total_syscalls++;
+}
+
+/* Called at every exit stop in --summary mode, regardless of -T: unlike
+ * the full trace line (which only shows timing when the user explicitly
+ * asked for -T, since it's one more thing cluttering every line), the
+ * summary table always has room for a "seconds"/"usecs/call" column and
+ * the cost of a couple of extra clock_gettime() calls per syscall is
+ * negligible next to everything else this tool already does per stop. */
+static void summary_add_time(long nr, double elapsed)
+{
+    if (nr >= 0 && nr < FILTER_MAX_NR)
+        time_sec[nr] += elapsed;
+    total_time_sec += elapsed;
 }
 
 /* Called at the exit stop: the syscall failed.  The failure is detected
@@ -178,8 +331,10 @@ static void summary_add_error(long nr)
 
 static void print_summary(void)
 {
-    printf("%9s %9s %9s %s\n", "calls", "errors", "pct", "syscall");
-    printf("%9s %9s %9s %s\n", "--------", "--------", "--------", "--------");
+    printf("%9s %9s %11s %11s %9s %s\n", "calls", "errors", "seconds",
+           "usecs/call", "pct", "syscall");
+    printf("%9s %9s %11s %11s %9s %s\n", "--------", "--------",
+           "-----------", "-----------", "--------", "--------");
     /* Sort by call count descending. */
     static int order[FILTER_MAX_NR];
     int n = 0;
@@ -199,11 +354,20 @@ static void print_summary(void)
         int nr = order[i];
         double pct = total_syscalls ? 100.0 * (double)counts[nr] /
                                           (double)total_syscalls : 0.0;
-        printf("%9llu %9llu %8.2f%% %s\n", counts[nr], error_counts[nr], pct,
+        unsigned long long avg_usec =
+            counts[nr] ? (unsigned long long)(time_sec[nr] * 1e6 /
+                                                (double)counts[nr] + 0.5)
+                       : 0;
+        printf("%9llu %9llu %11.6f %11llu %8.2f%% %s\n", counts[nr],
+               error_counts[nr], time_sec[nr], avg_usec, pct,
                syscall_name(nr));
     }
-    printf("%9llu %9llu %8s %s\n", total_syscalls, total_errors, "100.00%",
-           "total");
+    unsigned long long total_avg_usec =
+        total_syscalls ? (unsigned long long)(total_time_sec * 1e6 /
+                                                (double)total_syscalls + 0.5)
+                       : 0;
+    printf("%9llu %9llu %11.6f %11llu %8s %s\n", total_syscalls,
+           total_errors, total_time_sec, total_avg_usec, "100.00%", "total");
 }
 
 /* trace loop */
@@ -216,6 +380,23 @@ typedef struct {
     pid_t pid;
     long  pending_nr;
     bool  in_use;
+    struct timespec entry_time; /* CLOCK_MONOTONIC at the last entry stop,
+                                    so the matching exit stop can report
+                                    elapsed wall time. Only meaningful when
+                                    entry_time_valid is true. */
+    bool  entry_time_valid;     /* false until the first real entry stop
+                                    this tracee has had. An exit-shaped
+                                    stop can in principle be observed
+                                    before any entry has been recorded for
+                                    this pid (e.g. the transitional stop
+                                    right after a PTRACE_EVENT_EXEC, before
+                                    the exec'd program's first syscall has
+                                    produced its own entry stop) -- without
+                                    this flag, elapsed_since() would diff
+                                    against the zero-initialized {0,0}
+                                    sentinel and report a bogus multi-
+                                    hundred-second "syscall time" equal to
+                                    however long the machine has been up. */
 } tracee_state_t;
 
 static tracee_state_t *tracees = NULL;
@@ -236,6 +417,8 @@ static tracee_state_t *tracee_register(pid_t pid)
         if (!tracees[i].in_use) {
             tracees[i].pid = pid;
             tracees[i].pending_nr = -1;
+            tracees[i].entry_time = (struct timespec){0};
+            tracees[i].entry_time_valid = false;
             tracees[i].in_use = true;
             active_count++;
             return &tracees[i];
@@ -257,6 +440,8 @@ static tracee_state_t *tracee_register(pid_t pid)
     tracee_state_t *slot = &tracees[old_cap];
     slot->pid = pid;
     slot->pending_nr = -1;
+    slot->entry_time = (struct timespec){0};
+    slot->entry_time_valid = false;
     slot->in_use = true;
     active_count++;
     return slot;
@@ -291,6 +476,34 @@ static void handle_signal_stop(pid_t pid, int sig)
         _exit(1);
 }
 
+/* Wall-clock seconds elapsed since `entry` (a CLOCK_MONOTONIC timestamp),
+ * clamped to never go negative on a clock hiccup. Shared by --summary's
+ * per-syscall time accumulation and -T's per-line display. */
+static double elapsed_since(const struct timespec *entry)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double e = (double)(now.tv_sec - entry->tv_sec) +
+               (double)(now.tv_nsec - entry->tv_nsec) / 1e9;
+    return e < 0 ? 0.0 : e;
+}
+
+/* Formats an elapsed duration the way strace's -T does: " <0.000041>",
+ * leading space included so callers can just concatenate it onto the end
+ * of the result line. Returns "" (not a bug: same static-buffer contract
+ * as arg_decoder's helpers) when timing is disabled, so call sites don't
+ * need an extra branch. */
+static const char *format_elapsed(bool enabled, double secs)
+{
+    static char b[32];
+    if (!enabled) {
+        b[0] = '\0';
+        return b;
+    }
+    snprintf(b, sizeof(b), " <%.6f>", secs);
+    return b;
+}
+
 static void handle_fork_detected(pid_t pid, const syscall_stop_t *stop)
 {
     fprintf(stderr,
@@ -321,8 +534,21 @@ static bool handle_syscall_stop(options_t *opts, syscall_stop_t *stop,
      * it), so pending_nr is the only way to name/classify an exit stop or
      * attribute its error.  This is tracked per-pid (ts) so interleaved
      * tracees under -f don't clobber each other's in-flight syscall. */
-    if (stop->is_entry)
+    if (stop->is_entry) {
         ts->pending_nr = stop->syscall_nr;
+        /* Stamp the entry time now, before this stop is handled and the
+         * tracee resumed, so the interval measured on the matching exit
+         * stop covers the syscall's actual in-kernel time (plus whatever
+         * scheduling delay exists before the exit stop is delivered back
+         * to us -- the same wall-clock measurement strace's -T makes, not
+         * a kernel-reported figure). Stamped unconditionally (not gated
+         * on -T) because --summary always reports per-syscall timing now;
+         * -T only controls whether the *full* per-line trace also prints
+         * it. The clock_gettime() cost is negligible next to the ptrace
+         * calls already happening on every single stop. */
+        clock_gettime(CLOCK_MONOTONIC, &ts->entry_time);
+        ts->entry_time_valid = true;
+    }
 
     /* --filter applies in both --summary and full-trace mode: a filtered-
      * out syscall should neither be printed nor counted. */
@@ -344,6 +570,11 @@ static bool handle_syscall_stop(options_t *opts, syscall_stop_t *stop,
             long rv = stop->retval;
             if (rv < 0 && rv >= -4095)
                 summary_add_error(ts->pending_nr);
+            /* Skip time accounting entirely if we never saw this call's
+             * entry stop (see entry_time_valid's comment) rather than
+             * diffing against the zero sentinel and recording nonsense. */
+            if (ts->entry_time_valid)
+                summary_add_time(ts->pending_nr, elapsed_since(&ts->entry_time));
         }
         return true;
     }
@@ -355,9 +586,13 @@ static bool handle_syscall_stop(options_t *opts, syscall_stop_t *stop,
                arg_decode(stop->pid, stop->syscall_nr, stop->args));
         fflush(stdout);
     } else {
-        printf("%6d: %14s = %s\n", stop->pid,
+        double elapsed = (opts->timing && ts->entry_time_valid)
+                              ? elapsed_since(&ts->entry_time)
+                              : 0.0;
+        printf("%6d: %14s = %s%s\n", stop->pid,
                nr >= 0 ? syscall_name(nr) : "?",
-               arg_decode_retval(stop->retval));
+               arg_decode_retval(stop->retval),
+               format_elapsed(opts->timing, elapsed));
         fflush(stdout);
     }
     return true;
@@ -556,6 +791,27 @@ int main(int argc, char **argv)
             argi++;
             continue;
         }
+        if (!after_dashdash && strcmp(a, "-T") == 0) {
+            opts.timing = true;
+            argi++;
+            continue;
+        }
+        if (!after_dashdash && strcmp(a, "-e") == 0 && argi + 1 < argc) {
+            const char *expr = argv[argi + 1];
+            if (strncmp(expr, "trace=", 6) != 0) {
+                fprintf(stderr,
+                        "mini-trace: -e only supports 'trace=...' "
+                        "(e.g. -e trace=network)\n");
+                return 1;
+            }
+            if (!parse_trace_expr(expr + 6)) {
+                fprintf(stderr, "mini-trace: malformed -e trace=...\n");
+                return 1;
+            }
+            opts.filter_enabled = true;
+            argi += 2;
+            continue;
+        }
         if (!after_dashdash && strcmp(a, "--filter") == 0 &&
             argi + 1 < argc) {
             if (!parse_filter_list(argv[argi + 1])) {
@@ -612,11 +868,22 @@ int main(int argc, char **argv)
     if (ptrace_resume_cont(pid, 0) == -1)
         return 1;
 
-    /* Main loop: PTRACE_CONT ran the leader to its first syscall entry;
-     * every later resume is PTRACE_SYSCALL, alternating entry/exit stops.
-     * With -f, waitpid(-1) inside wait_and_handle also picks up every
-     * auto-attached fork/vfork/clone child; the loop keeps going until no
-     * tracee (leader or child) is left alive. */
+    /* Main loop: PTRACE_CONT (not PTRACE_SYSCALL) ran the leader freely
+     * until its first *event* stop -- since CONT alone doesn't arm
+     * per-syscall stepping, any syscalls the leader makes before that
+     * (e.g. execvp()'s internal PATH-search stat/access calls) run
+     * unobserved, and the first stop we actually catch is the successful
+     * execve's PTRACE_EVENT_EXEC (handled by handle_exec_event, not the
+     * ordinary entry/exit path). Every later resume is PTRACE_SYSCALL, so
+     * from there on stops alternate entry/exit as documented above --
+     * except for one further wrinkle: the stop immediately following that
+     * event switch to PTRACE_SYSCALL is itself sometimes already
+     * exit-shaped, with no entry ever observed for it (see
+     * entry_time_valid's comment on tracee_state_t for why this matters
+     * for -T/--summary timing). With -f, waitpid(-1) inside
+     * wait_and_handle also picks up every auto-attached fork/vfork/clone
+     * child; the loop keeps going until no tracee (leader or child) is
+     * left alive. */
     while (wait_and_handle(&opts))
         ;
 
