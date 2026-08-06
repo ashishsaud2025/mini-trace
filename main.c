@@ -224,8 +224,15 @@ static bool handle_syscall_stop(options_t *opts, syscall_stop_t *stop)
     if (opts->summary) {
         if (stop->is_entry) {
             summary_add(stop);
-        } else if (stop->is_error) {
-            summary_add_error(pending_nr);
+        } else {
+            /* x86_64 kernel convention: a syscall return value in the
+             * range [-4095, -1] means "failed, and -retval is the errno"
+             * (IS_ERR_VALUE).  Checking the raw retval directly is
+             * robust on both the modern GET_SYSCALL_INFO path and the
+             * orig_rax==-1 heuristic fallback. */
+            long rv = stop->retval;
+            if (rv < 0 && rv >= -4095)
+                summary_add_error(pending_nr);
         }
         return true;
     }
