@@ -203,11 +203,9 @@ bool ptrace_fetch_stop(pid_t pid, syscall_stop_t *stop)
      * miscounted as an additional entry (doubling counts and hiding
      * errors).  Compute the field end explicitly instead. */
     long entry_end =
-        (long)offsetof(struct ptrace_syscall_info, entry) +
         (long)offsetof(struct ptrace_syscall_info, entry.args) +
         (long)sizeof(sci.entry.args);                       /* 80 */
     long exit_end  =
-        (long)offsetof(struct ptrace_syscall_info, exit) +
         (long)offsetof(struct ptrace_syscall_info, exit.is_error) +
         (long)sizeof(sci.exit.is_error);                    /* 33 */
     if (r == entry_end || r == exit_end) {
