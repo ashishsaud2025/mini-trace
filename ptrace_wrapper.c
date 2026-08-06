@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ptrace.h>
+#include <linux/ptrace.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -176,7 +177,10 @@ bool ptrace_fetch_stop(pid_t pid, syscall_stop_t *stop)
     /* entry vs exit classification 
      *
      * Preferred path: PTRACE_GET_SYSCALL_INFO (Linux >= 5.3) reports the
-     * phase directly and also gives us the syscall number at both stops.
+     * phase directly.  At the entry stop it gives us the syscall number
+     * and the six arguments; at the exit stop it only gives us the return
+     * value (the kernel's struct has no nr in the exit branch -- the name
+     * is tracked across stops by main.c via pending entry numbers).
      * Fallback path (older kernels / reduced seccomp): the x86_64 kernel
      * sets orig_rax = -1 at the exit stop; at the entry stop orig_rax is
      * the syscall number.  This is the classic strace heuristic.
@@ -199,8 +203,11 @@ bool ptrace_fetch_stop(pid_t pid, syscall_stop_t *stop)
             return true;
         }
         if (sci.op == PTRACE_SYSCALL_INFO_EXIT) {
+            /* The exit branch of ptrace_syscall_info has no `nr` member
+             * (only rval/is_error); the caller tracks the syscall number
+             * from the preceding entry stop. */
             stop->is_entry = false;
-            stop->syscall_nr = sci.exit.nr;
+            stop->syscall_nr = -1;
             stop->retval = sci.exit.rval;
             /* Force the classic markers too, for uniformity. */
             stop->regs.orig_rax = -1;

@@ -204,23 +204,26 @@ static bool handle_syscall_stop(options_t *opts, syscall_stop_t *stop)
         return true;
     }
 
+    /* Record the most recent entry number regardless of filtering: exit
+     * stops never carry the syscall number (neither the GET_SYSCALL_INFO
+     * exit branch nor the orig_rax==-1 heuristic provides it), so
+     * pending_nr is the only way to name/classify an exit stop. */
+    if (stop->is_entry)
+        pending_nr = stop->syscall_nr;
+
+    long nr = pending_nr;
     bool show = !opts->filter_enabled ||
-                (stop->syscall_nr >= 0 && stop->syscall_nr < FILTER_MAX_NR &&
-                 filter_list[stop->syscall_nr]);
+                (nr >= 0 && nr < FILTER_MAX_NR && filter_list[nr]);
     if (!show)
         return true;
 
     if (stop->is_entry) {
-        pending_nr = stop->syscall_nr;
         printf("%6d: syscall %3ld (%s)( %s )\n",
                stop->pid, stop->syscall_nr,
                syscall_name(stop->syscall_nr),
                arg_decode(stop->pid, stop->syscall_nr, stop->args));
         fflush(stdout);
     } else {
-        /* On the PTRACE_GET_SYSCALL_INFO path the exit stop carries the
-         * number itself; on the fallback path we use the last entry. */
-        long nr = (stop->syscall_nr >= 0) ? stop->syscall_nr : pending_nr;
         printf("%6d: %14s = %s\n", stop->pid,
                nr >= 0 ? syscall_name(nr) : "?",
                arg_decode_retval(stop->retval));

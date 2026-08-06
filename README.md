@@ -118,9 +118,14 @@ Two mechanisms are implemented, selected automatically:
 
 - **`PTRACE_GET_SYSCALL_INFO` (Linux ≥ 5.3, preferred).** This ptrace
   operation reports the stop phase (`PTRACE_SYSCALL_INFO_ENTRY` /
-  `PTRACE_SYSCALL_INFO_EXIT`), the syscall number, the six arguments, and the
-  return value directly. This is the modern replacement for the old
-  `orig_rax == -1` heuristic and is what strace uses.
+  `PTRACE_SYSCALL_INFO_EXIT`) plus a small struct whose *entry* branch
+  carries the syscall number and six arguments and whose *exit* branch
+  carries only the return value (`rval`) and an `is_error` flag — the
+  kernel does **not** include the syscall number on the exit stop. This
+  is the modern replacement for the `orig_rax == -1` heuristic, and it's
+  what strace uses. Because the exit number is absent, mini-trace tracks
+  the most recent entry number across stops to name and classify exit
+  stops.
 - **`orig_rax == -1` heuristic (fallback).** Before
   `PTRACE_GET_SYSCALL_INFO`, tracers read the register `orig_rax`:
   - entry stop: `orig_rax` holds the syscall number,
