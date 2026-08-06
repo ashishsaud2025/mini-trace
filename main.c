@@ -324,6 +324,14 @@ static bool handle_syscall_stop(options_t *opts, syscall_stop_t *stop,
     if (stop->is_entry)
         ts->pending_nr = stop->syscall_nr;
 
+    /* --filter applies in both --summary and full-trace mode: a filtered-
+     * out syscall should neither be printed nor counted. */
+    long nr = ts->pending_nr;
+    bool show = !opts->filter_enabled ||
+                (nr >= 0 && nr < FILTER_MAX_NR && filter_list[nr]);
+    if (!show)
+        return true;
+
     if (opts->summary) {
         if (stop->is_entry) {
             summary_add(stop);
@@ -339,12 +347,6 @@ static bool handle_syscall_stop(options_t *opts, syscall_stop_t *stop,
         }
         return true;
     }
-
-    long nr = ts->pending_nr;
-    bool show = !opts->filter_enabled ||
-                (nr >= 0 && nr < FILTER_MAX_NR && filter_list[nr]);
-    if (!show)
-        return true;
 
     if (stop->is_entry) {
         printf("%6d: syscall %3ld (%s)( %s )\n",
