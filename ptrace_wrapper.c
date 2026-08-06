@@ -185,6 +185,7 @@ bool ptrace_fetch_stop(pid_t pid, syscall_stop_t *stop)
      * sets orig_rax = -1 at the exit stop; at the entry stop orig_rax is
      * the syscall number.  This is the classic strace heuristic.
      */
+#ifdef PTRACE_GET_SYSCALL_INFO
     struct ptrace_syscall_info sci;
     memset(&sci, 0, sizeof(sci));
     long r = ptrace(PTRACE_GET_SYSCALL_INFO, pid, sizeof(sci), &sci);
@@ -226,11 +227,12 @@ bool ptrace_fetch_stop(pid_t pid, syscall_stop_t *stop)
         /* seccomp / other unexpected info opcode: fall through to the
          * classic heuristic rather than failing the whole trace. */
     }
+#endif /* PTRACE_GET_SYSCALL_INFO */
 
-    /* Classic heuristic (also the fallback on kernels < 5.3 where
-     * GET_SYSCALL_INFO returns -1 with EIO/EINVAL): the x86_64 kernel
-     * sets orig_rax = -1 at the exit stop; at the entry stop orig_rax is
-     * the syscall number. */
+    /* Classic heuristic (also the fallback on kernels < 5.3, or on
+     * builds whose headers lack PTRACE_GET_SYSCALL_INFO): the x86_64
+     * kernel sets orig_rax = -1 at the exit stop; at the entry stop
+     * orig_rax is the syscall number. */
     if ((long)stop->regs.orig_rax == -1) {
         stop->is_entry = false;
         stop->syscall_nr = -1;
